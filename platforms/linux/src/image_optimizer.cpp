@@ -488,6 +488,7 @@ enum class LegacyOutcome { Optimized, OriginalKept, Error };
 struct LegacyResult {
     LegacyOutcome outcome = LegacyOutcome::Error;
     std::string reason;
+    fs::path output_path;
 };
 
 static LegacyResult fail(const std::string& why) {
@@ -501,24 +502,50 @@ static LegacyResult keep_original(const fs::path& input, const fs::path& output,
                             const std::string& reason) {
     LegacyResult r;
     r.reason = reason;
-    if (!cfg.no_copy) {
-        fs::path tmp;
-        std::string temp_err;
-        if (!create_temp_file(output, tmp, temp_err))
-            return fail("creation du fichier temporaire impossible : " + temp_err);
-        std::error_code ec;
-        fs::copy_file(input, tmp, fs::copy_options::overwrite_existing, ec);
-        if (ec) {
-            fs::remove(tmp, ec);
-            return fail("erreur de copie : " + ec.message());
-        }
-        std::string err;
-        if (!replace_file(tmp, output, err)) {
-            fs::remove(tmp, ec);
-            return fail("impossible d'ecrire la sortie : " + err);
-        }
+
+    if (cfg.no_copy) {
+        r.outcome = LegacyOutcome::OriginalKept;
+        r.output_path = input;
+        return r;
     }
+
+    ImageInfo info;
+    std::string analyze_error;
+    fs::path destination = output;
+
+    if (analyze_image(input, info, analyze_error)) {
+        if (info.codec == "mjpeg")
+            destination.replace_extension(".jpg");
+        else if (info.codec == "png")
+            destination.replace_extension(".png");
+        else if (info.codec == "webp")
+            destination.replace_extension(".webp");
+        else
+            destination.replace_extension(input.extension());
+    } else {
+        destination.replace_extension(input.extension());
+    }
+
+    fs::path tmp;
+    std::string temp_err;
+    if (!create_temp_file(destination, tmp, temp_err))
+        return fail("creation du fichier temporaire impossible : " + temp_err);
+
+    std::error_code ec;
+    fs::copy_file(input, tmp, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        return fail("erreur de copie : " + ec.message());
+    }
+
+    std::string err;
+    if (!replace_file(tmp, destination, err)) {
+        fs::remove(tmp, ec);
+        return fail("impossible d'ecrire la sortie : " + err);
+    }
+
     r.outcome = LegacyOutcome::OriginalKept;
+    r.output_path = destination;
     return r;
 }
 
@@ -724,15 +751,17 @@ Result optimize_image(
     Result result;
     result.media_type = MediaType::Image;
     result.input_path = input;
-    result.output_path = output;
+    result.output_path = legacy.output_path.empty()
+        ? output
+        : legacy.output_path;
 
     std::error_code ec;
     if (std::filesystem::exists(input, ec))
         result.input_size = std::filesystem::file_size(input, ec);
 
     ec.clear();
-    if (std::filesystem::exists(output, ec))
-        result.output_size = std::filesystem::file_size(output, ec);
+    if (std::filesystem::exists(result.output_path, ec))
+        result.output_size = std::filesystem::file_size(result.output_path, ec);
 
     switch (legacy.outcome) {
     case LegacyOutcome::Optimized:

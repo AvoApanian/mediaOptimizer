@@ -17,6 +17,8 @@
 #include <fcntl.h>
 #include <setjmp.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <linux/fs.h>
 #include <unistd.h>
 
 #include <jpeglib.h>
@@ -789,21 +791,25 @@ bool write_atomic(
         return false;
     }
 
-    if (link(temporary.c_str(), path.c_str()) != 0) {
+    const long publish_result = syscall(
+        SYS_renameat2,
+        AT_FDCWD,
+        temporary.c_str(),
+        AT_FDCWD,
+        path.c_str(),
+        RENAME_NOREPLACE
+    );
+
+    if (publish_result != 0) {
         const int saved_errno = errno;
         unlink(temporary.c_str());
 
         if (saved_errno == EEXIST) {
             error = "Output file already exists; refusing to overwrite it.";
         } else {
-            error = "Unable to publish WebP output safely.";
+            error = "Unable to publish output atomically without overwriting.";
         }
 
-        return false;
-    }
-
-    if (unlink(temporary.c_str()) != 0) {
-        error = "WebP output was published, but temporary file cleanup failed.";
         return false;
     }
 
@@ -812,17 +818,101 @@ bool write_atomic(
 
 Result keep_original(
     const std::filesystem::path& input,
+    const std::filesystem::path& output,
     std::uintmax_t input_size,
+    bool no_copy,
     const std::string& reason
 ) {
     Result result;
-    result.status = Status::OriginalKept;
     result.media_type = MediaType::Image;
     result.input_path = input;
-    result.output_path = input;
     result.input_size = input_size;
-    result.output_size = input_size;
     result.reason = reason;
+
+    if (no_copy) {
+        result.status = Status::OriginalKept;
+        result.output_path = input;
+        result.output_size = input_size;
+        return result;
+    }
+
+    if (output.empty()) {
+        result.error = "Output path is empty.";
+        return result;
+    }
+
+    std::error_code ec;
+    if (std::filesystem::equivalent(input, output, ec) && !ec) {
+        result.status = Status::OriginalKept;
+        result.output_path = input;
+        result.output_size = input_size;
+        return result;
+    }
+
+    ec.clear();
+
+    std::vector<std::uint8_t> data;
+    std::string error;
+
+    if (!read_file(input, data, error)) {
+        result.error = error;
+        result.output_path = output;
+        return result;
+    }
+
+    std::filesystem::path destination = output;
+
+    switch (detect_format(data)) {
+        case Format::JPEG:
+            destination.replace_extension(".jpg");
+            break;
+        case Format::PNG:
+            destination.replace_extension(".png");
+            break;
+        case Format::WEBP:
+            destination.replace_extension(".webp");
+            break;
+        case Format::Unsupported:
+            destination.replace_extension(input.extension());
+            break;
+    }
+
+    const auto absolute_input = std::filesystem::absolute(
+        input,
+        ec
+    ).lexically_normal();
+
+    if (ec) {
+        result.error = "Unable to resolve original image path.";
+        return result;
+    }
+
+    const auto absolute_output = std::filesystem::absolute(
+        destination,
+        ec
+    ).lexically_normal();
+
+    if (ec) {
+        result.error = "Unable to resolve output image path.";
+        return result;
+    }
+
+    if (absolute_input == absolute_output) {
+        result.status = Status::OriginalKept;
+        result.output_path = input;
+        result.output_size = input_size;
+        return result;
+    }
+
+    if (!write_atomic(destination, data, error)) {
+        result.error = error;
+        result.output_path = destination;
+        return result;
+    }
+
+    result.status = Status::OriginalKept;
+    result.output_path = destination;
+    result.output_size = data.size();
     return result;
 }
 
@@ -874,7 +964,9 @@ Result optimize_image(
     if (format == Format::Unsupported) {
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             "Unsupported image format. Original preserved."
         );
     }
@@ -885,7 +977,9 @@ Result optimize_image(
         jpeg_metadata_present(data)) {
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             "JPEG contains metadata or markers that are not preserved."
         );
     }
@@ -894,7 +988,9 @@ Result optimize_image(
         png_metadata_or_animation_present(data, is_16_bit)) {
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             is_16_bit
                 ? "16-bit PNG or PNG metadata/animation cannot be safely preserved."
                 : "PNG metadata or animation cannot be safely preserved."
@@ -925,7 +1021,9 @@ Result optimize_image(
     if (!decoded) {
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             error.empty() ? "Image could not be decoded safely." : error
         );
     }
@@ -950,7 +1048,7 @@ Result optimize_image(
             config.webp_quality,
             encoded,
             error)) {
-        return keep_original(input, input_size, error);
+        return keep_original(input, output, input_size, config.no_copy, error);
     }
 
     int decoded_width = 0;
@@ -966,7 +1064,9 @@ Result optimize_image(
     if (!verification) {
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             "Encoded WebP failed verification."
         );
     }
@@ -977,7 +1077,9 @@ Result optimize_image(
 
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             "Encoded WebP dimensions do not match the expected dimensions."
         );
     }
@@ -998,7 +1100,9 @@ Result optimize_image(
 
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             "Not enough memory to verify WebP output."
         );
     }
@@ -1013,7 +1117,9 @@ Result optimize_image(
     if (psnr < config.min_psnr_db) {
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             "WebP quality is below the configured minimum PSNR."
         );
     }
@@ -1021,7 +1127,9 @@ Result optimize_image(
     if (encoded.size() >= input_size && !was_resized) {
         return keep_original(
             input,
+            output,
             input_size,
+            config.no_copy,
             "WebP output is not smaller than the original."
         );
     }
